@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::slice::IterMut;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -535,9 +536,8 @@ impl PanelSpace {
             // check if it can be expanded
             self.relax_overflow_center(center_overflow.unsigned_abs(), &mut center_overflow_button)
         } else if center_overflow > 0 {
-            let overflow = self.shrink_center((center_sum - target_center_len) as u32);
-            self.is_dirty = true;
-            self.needs_layout = true;
+            let (overflow, changed) = self.shrink_center((center_sum - target_center_len) as u32);
+            self.handle_unresolved_overflow(OverflowSection::Center, overflow, changed);
             bail!("overflow: {}", overflow)
         }
 
@@ -548,9 +548,8 @@ impl PanelSpace {
                 self.relax_overflow_left(left_overflow.unsigned_abs(), &mut left_overflow_button);
             } else if left_overflow > 0 {
                 info!("target: {target_left_len}, actual: {left_sum}");
-                let overflow = self.shrink_left(left_overflow as u32);
-                self.is_dirty = true;
-                self.needs_layout = true;
+                let (overflow, changed) = self.shrink_left(left_overflow as u32);
+                self.handle_unresolved_overflow(OverflowSection::Left, overflow, changed);
 
                 bail!("left overflow: {} {}", left_overflow, overflow)
             }
@@ -562,9 +561,8 @@ impl PanelSpace {
                     &mut right_overflow_button,
                 );
             } else if right_overflow > 0 {
-                let overflow = self.shrink_right(right_overflow as u32);
-                self.is_dirty = true;
-                self.needs_layout = true;
+                let (overflow, changed) = self.shrink_right(right_overflow as u32);
+                self.handle_unresolved_overflow(OverflowSection::Right, overflow, changed);
 
                 bail!("right overflow: {} {}", right_overflow, overflow)
             }
@@ -727,7 +725,7 @@ impl PanelSpace {
                 if minimize_priority.is_some() {
                     let new_rect = Rectangle {
                         loc: (x, y).into(),
-                        size: ((size.w.ceil() as i32).max(1), (size.w.ceil() as i32).max(1)).into(),
+                        size: ((size.w.ceil() as i32).max(1), (size.h.ceil() as i32).max(1)).into(),
                     };
                     if new_rect != self.minimize_applet_rect
                         && Instant::now().duration_since(self.last_minimize_update)
@@ -839,13 +837,65 @@ impl PanelSpace {
         } else {
             PanelBorder::Full
         };
+
+        let start_overlap = if self.logical_layer_start_overlap > 0 && is_overlapping_start {
+            self.logical_layer_start_overlap + self.config.spacing as i32
+        } else {
+            0
+        };
+
+        let end_overlap = if self.logical_layer_end_overlap > 0 && is_overlapping_end {
+            self.logical_layer_end_overlap + self.config.spacing as i32
+        } else {
+            0
+        };
+
+        let mut bg_loc = match self.config.anchor {
+            PanelAnchor::Left => [
+                self.config.margin as f32 + self.anchor_gap as f32,
+                container_lengthwise_pos as f32,
+            ],
+            PanelAnchor::Right => [-self.anchor_gap as f32, container_lengthwise_pos as f32],
+            PanelAnchor::Bottom => [container_lengthwise_pos as f32, -self.anchor_gap as f32],
+            PanelAnchor::Top => [
+                container_lengthwise_pos as f32,
+                self.config.margin as f32 + self.anchor_gap as f32,
+            ],
+        };
+
+        if is_overlapping_start {
+            if self.config.is_horizontal() {
+                bg_loc[0] += start_overlap as f32 - container_lengthwise_pos as f32;
+                w -= start_overlap - container_lengthwise_pos;
+            } else {
+                bg_loc[1] += start_overlap as f32 - container_lengthwise_pos as f32;
+                h -= start_overlap - container_lengthwise_pos;
+            }
+        }
+        if is_overlapping_end {
+            if self.config.is_horizontal() {
+                w -= end_overlap - container_lengthwise_pos;
+            } else {
+                h -= end_overlap - container_lengthwise_pos;
+            }
+        }
+        if self.config.is_horizontal() {
+            h -= self.config.margin as i32;
+        } else {
+            w -= self.config.margin as i32;
+        }
+
+        let bg_pos = (bg_loc[0] as i32, bg_loc[1] as i32);
         if !self.background_element.as_ref().is_some_and(|e| {
             e.with_program(|p| {
                 p.logical_height == h
                     && p.logical_width == w
+                    && p.logical_pos == bg_pos
                     && self.bg_color() == p.color
                     && p.scale == self.scale
+                    && p.radius == radius
                     && p.border == border
+                    && p.border_width == self.config.border_width
             })
         }) || self.animate_state.as_ref().is_some()
             || self.transitioning
@@ -856,57 +906,11 @@ impl PanelSpace {
                 self.space.unmap_elem(&CosmicMappedInternal::Background(bg));
             }
 
-            let start_overlap = if self.logical_layer_start_overlap > 0 && is_overlapping_start {
-                self.logical_layer_start_overlap + self.config.spacing as i32
-            } else {
-                0
-            };
-
-            let end_overlap = if self.logical_layer_end_overlap > 0 && is_overlapping_end {
-                self.logical_layer_end_overlap + self.config.spacing as i32
-            } else {
-                0
-            };
-
             let Some(output) = self.output.as_ref().map(|o| o.1.clone()) else {
                 self.is_dirty = true;
                 self.needs_layout = true;
                 bail!("output missing");
             };
-            let mut loc = match self.config.anchor {
-                PanelAnchor::Left => [
-                    self.config.margin as f32 + self.anchor_gap as f32,
-                    container_lengthwise_pos as f32,
-                ],
-                PanelAnchor::Right => [-self.anchor_gap as f32, container_lengthwise_pos as f32],
-                PanelAnchor::Bottom => [container_lengthwise_pos as f32, -self.anchor_gap as f32],
-                PanelAnchor::Top => [
-                    container_lengthwise_pos as f32,
-                    self.config.margin as f32 + self.anchor_gap as f32,
-                ],
-            };
-
-            if is_overlapping_start {
-                if self.config.is_horizontal() {
-                    loc[0] += start_overlap as f32 - container_lengthwise_pos as f32;
-                    w -= start_overlap - container_lengthwise_pos;
-                } else {
-                    loc[1] += start_overlap as f32 - container_lengthwise_pos as f32;
-                    h -= start_overlap - container_lengthwise_pos;
-                }
-            }
-            if is_overlapping_end {
-                if self.config.is_horizontal() {
-                    w -= end_overlap - container_lengthwise_pos;
-                } else {
-                    h -= end_overlap - container_lengthwise_pos;
-                }
-            }
-            if self.config.is_horizontal() {
-                h -= self.config.margin as i32;
-            } else {
-                w -= self.config.margin as i32;
-            }
             let bg = background_element(
                 Id::new("panel_bg"),
                 w,
@@ -915,7 +919,7 @@ impl PanelSpace {
                 self.shared.loop_handle.clone(),
                 self.colors.theme.clone(),
                 self.space.id(),
-                loc,
+                bg_loc,
                 self.bg_color(),
                 self.scale,
                 border,
@@ -923,11 +927,7 @@ impl PanelSpace {
             );
             bg.output_enter(&output, Rectangle::default());
             self.background_element = Some(bg.clone());
-            self.space.map_element(
-                CosmicMappedInternal::Background(bg),
-                (loc[0] as i32, loc[1] as i32),
-                false,
-            );
+            self.space.map_element(CosmicMappedInternal::Background(bg), bg_pos, false);
             self.is_background_dirty = false;
         }
         if self.animate_state.is_none() {
@@ -1065,7 +1065,8 @@ impl PanelSpace {
         }
 
         let mut overflow_cnt: usize = 0;
-        let cur_cnt = elements.len();
+        let applet_cnt =
+            elements.iter().filter(|e| matches!(e, PopupMappedInternal::Window(_))).count();
 
         let _applet_size_unit = self.config.size.get_applet_icon_size_with_padding(true);
         let _padding = self.config.padding as i32;
@@ -1074,31 +1075,23 @@ impl PanelSpace {
             return;
         };
 
+        let client_order: HashMap<_, _> = clients
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| c.client.as_ref().map(|client| (client.id(), i)))
+            .collect();
         elements.sort_by(|a, b| {
             // sort by position in client list
-            let pos_a = clients.iter().position(|c| {
-                if let PopupMappedInternal::Window(w) = a {
-                    w.toplevel().is_some_and(|t| {
-                        t.wl_surface().client().is_some_and(|w_client| {
-                            c.client.as_ref().is_some_and(|c| *c == w_client)
-                        })
-                    })
+            let pos = |e: &PopupMappedInternal| {
+                if let PopupMappedInternal::Window(w) = e {
+                    w.toplevel()
+                        .and_then(|t| t.wl_surface().client())
+                        .and_then(|client| client_order.get(&client.id()).copied())
                 } else {
-                    false
+                    None
                 }
-            });
-            let pos_b = clients.iter().position(|c| {
-                if let PopupMappedInternal::Window(w) = b {
-                    w.toplevel().is_some_and(|t| {
-                        t.wl_surface().client().is_some_and(|w_client| {
-                            c.client.as_ref().is_some_and(|c| *c == w_client)
-                        })
-                    })
-                } else {
-                    false
-                }
-            });
-            pos_a.cmp(&pos_b)
+            };
+            pos(a).cmp(&pos(b))
         });
 
         let (major_padding, cross_padding) = (
@@ -1117,11 +1110,12 @@ impl PanelSpace {
                     if !w.alive() {
                         space.unmap_elem(&PopupMappedInternal::Window(w.clone()));
                     } else {
-                        let x_i = overflow_cnt % 8;
+                        let x_i = overflow_cnt % OVERFLOW_ROW_LEN;
                         let mut x = BORDER_WIDTH as i32
                             + x_i as i32 * (applet_size_unit_major as i32 + spacing);
                         let mut y = BORDER_WIDTH as i32
-                            + (overflow_cnt / 8) as i32 * (applet_size_unit_cross as i32 + spacing);
+                            + (overflow_cnt / OVERFLOW_ROW_LEN) as i32
+                                * (applet_size_unit_cross as i32 + spacing);
                         if !self.config.is_horizontal() {
                             std::mem::swap(&mut x, &mut y);
                         }
@@ -1131,16 +1125,14 @@ impl PanelSpace {
                 },
                 PopupMappedInternal::Popup(p) => {
                     let prev_cnt = p.with_program(|p| p.count);
-                    if prev_cnt != cur_cnt {
-                        let actual = cur_cnt.saturating_sub(1);
-                        let mut popup_major = 2. * BORDER_WIDTH as f32
-                            + actual.min(8) as f32 * applet_size_unit_major as f32
-                            + (actual.min(8).saturating_sub(1) as f32) * spacing as f32;
-                        let mut popup_cross = 2. * BORDER_WIDTH as f32
-                            + (actual as f32 / 8.).ceil().min(1.0) * applet_size_unit_cross as f32;
-                        if !self.config.is_horizontal() {
-                            std::mem::swap(&mut popup_major, &mut popup_cross);
-                        }
+                    if prev_cnt != applet_cnt {
+                        let (popup_major, popup_cross) = overflow_popup_size(
+                            applet_cnt,
+                            applet_size_unit_major,
+                            applet_size_unit_cross,
+                            spacing,
+                            self.config.is_horizontal(),
+                        );
 
                         let new_popup = PopupMappedInternal::Popup(overflow_popup_element(
                             match section {
@@ -1153,11 +1145,17 @@ impl PanelSpace {
                             self.shared.loop_handle.clone(),
                             self.colors.theme.clone(),
                             self.space.id(),
-                            actual,
+                            applet_cnt,
                         ));
                         space.unmap_elem(&PopupMappedInternal::Popup(p.clone()));
                         new_popup.output_enter(&output, Rectangle::default());
                         space.map_element(new_popup, (0, 0), false);
+
+                        if let Some((popup, open_section)) = self.overflow_popup.as_mut()
+                            && *open_section == section
+                        {
+                            popup.dirty = true;
+                        }
                     }
                 },
                 _ => (),
@@ -1227,14 +1225,14 @@ impl PanelSpace {
         overflow_partition
     }
 
-    fn shrink_left(&mut self, overflow: u32) -> u32 {
+    fn shrink_left(&mut self, overflow: u32) -> (u32, bool) {
         let left = self.clients_left.lock().unwrap();
         let mut clients = self.shrinkable_clients(left.iter());
         drop(left);
         self.shrink_clients(overflow, &mut clients, OverflowSection::Left, false)
     }
 
-    fn shrink_center(&mut self, overflow: u32) -> u32 {
+    fn shrink_center(&mut self, overflow: u32) -> (u32, bool) {
         let g = self.clients_center.lock().unwrap();
         let left_g = self.clients_left.lock().unwrap();
         let right_g = self.clients_right.lock().unwrap();
@@ -1250,11 +1248,31 @@ impl PanelSpace {
         self.shrink_clients(overflow, &mut clients, OverflowSection::Center, false)
     }
 
-    fn shrink_right(&mut self, overflow: u32) -> u32 {
+    fn shrink_right(&mut self, overflow: u32) -> (u32, bool) {
         let right = self.clients_right.lock().unwrap();
         let mut clients = self.shrinkable_clients(right.iter());
         drop(right);
         self.shrink_clients(overflow, &mut clients, OverflowSection::Right, false)
+    }
+
+    fn handle_unresolved_overflow(
+        &mut self,
+        section: OverflowSection,
+        overflow: u32,
+        changed: bool,
+    ) {
+        if changed {
+            self.overflow_stall_logged = false;
+            self.is_dirty = true;
+            self.needs_layout = true;
+        } else if !self.overflow_stall_logged {
+            self.overflow_stall_logged = true;
+            info!(
+                "Cannot resolve {}px of overflow in section {section:?}: no shrinkable or \
+                 movable applet remains. Will retry when layout inputs change.",
+                overflow
+            );
+        }
     }
 
     fn shrink_clients(
@@ -1263,7 +1281,8 @@ impl PanelSpace {
         clients: &mut OverflowClientPartition,
         section: OverflowSection,
         force_smaller: bool,
-    ) -> u32 {
+    ) -> (u32, bool) {
+        let mut changed = false;
         info!("Overflow: {overflow} in section {section:?}");
         let unit_size = self.config.size.get_applet_icon_size_with_padding(true);
 
@@ -1337,25 +1356,29 @@ impl PanelSpace {
                     }
                 });
                 t.send_pending_configure();
+                changed = true;
                 overflow = overflow.saturating_sub(diff);
             }
         }
         if overflow > 0 {
-            overflow = self.move_to_overflow(
+            let (remaining, moved) = self.move_to_overflow(
                 overflow,
                 self.config.is_horizontal(),
                 clients.clone(),
                 section,
             );
+            overflow = remaining;
+            changed |= moved;
         }
         if overflow > 0 && !force_smaller {
             tracing::info!(
                 "Overflow not resolved {sum:.1} {overflow}. Forcing lowest priority shrinkable \
                  applets to be smaller than configured...",
             );
-            return self.shrink_clients(overflow, clients, section, true);
+            let (remaining, forced) = self.shrink_clients(overflow, clients, section, true);
+            return (remaining, changed || forced);
         }
-        overflow
+        (overflow, changed)
     }
 
     /// Move clients to overflow space
@@ -1365,10 +1388,13 @@ impl PanelSpace {
         is_horizontal: bool,
         clients: OverflowClientPartition,
         section: OverflowSection,
-    ) -> u32 {
+    ) -> (u32, bool) {
         if clients.movable.len() <= 1 {
-            tracing::info!("Needs at least 2 movable clients to move to overflow space.");
-            return overflow;
+            info!(
+                "Needs at least 2 movable clients to move to overflow space; {} available.",
+                clients.movable.len()
+            );
+            return (overflow, false);
         }
         let (major_padding, cross_padding) = (
             self.config.size.get_applet_shrinkable_padding(true),
@@ -1400,6 +1426,7 @@ impl PanelSpace {
         if overflow_cnt == 0 {
             overflow += applet_size_unit_major + spacing;
         }
+        let mut moved = false;
         let space = &mut self.space;
 
         tracing::info!("Number of movable clients {}", clients.movable.len());
@@ -1419,18 +1446,19 @@ impl PanelSpace {
             let diff = if is_horizontal { bbox.size.w as u32 } else { bbox.size.h as u32 };
             overflow = overflow.saturating_sub(diff);
 
-            let x_i = overflow_cnt % 8;
+            let x_i = overflow_cnt % OVERFLOW_ROW_LEN;
             let mut x =
                 x_i as i32 * (applet_size_unit_major as i32 + spacing as i32) + BORDER_WIDTH as i32;
             let mut y = BORDER_WIDTH as i32
-                + (overflow_cnt / 8) as i32 * (applet_size_unit_cross + spacing) as i32;
+                + (overflow_cnt / OVERFLOW_ROW_LEN) as i32
+                    * (applet_size_unit_cross + spacing) as i32;
             if !self.config.is_horizontal() {
                 std::mem::swap(&mut x, &mut y);
             }
 
             space.unmap_elem(&CosmicMappedInternal::Window(w.0.clone()));
             overflow_space.map_element(PopupMappedInternal::Window(w.0.clone()), (x, y / 2), true);
-            // Rows of 8 with configured applet size
+            // Rows of OVERFLOW_ROW_LEN with configured applet size
             if let Some(t) = w.0.toplevel() {
                 with_states(t.wl_surface(), |states| {
                     with_fractional_scale(states, |fractional_scale| {
@@ -1445,6 +1473,7 @@ impl PanelSpace {
                 t.send_pending_configure();
             }
             overflow_cnt += 1;
+            moved = true;
         }
         overflow_space.refresh();
         let overflow_cnt = overflow_space
@@ -1452,16 +1481,13 @@ impl PanelSpace {
             .filter(|e| if let PopupMappedInternal::Window(w) = e { w.alive() } else { false })
             .count();
 
-        let space = self.config.spacing as f32;
-
-        let mut popup_major = 2. * BORDER_WIDTH as f32
-            + overflow_cnt.min(8) as f32 * applet_size_unit_major as f32
-            + (overflow_cnt.min(8).saturating_sub(1) as f32) * space;
-        let mut popup_cross = 2. * BORDER_WIDTH as f32
-            + (overflow_cnt as f32 / 8.).ceil().min(1.0) * applet_size_unit_cross as f32;
-        if !self.config.is_horizontal() {
-            std::mem::swap(&mut popup_major, &mut popup_cross);
-        }
+        let (popup_major, popup_cross) = overflow_popup_size(
+            overflow_cnt,
+            applet_size_unit_major,
+            applet_size_unit_cross,
+            self.config.spacing as i32,
+            self.config.is_horizontal(),
+        );
         let popup = overflow_space
             .elements()
             .find(|e| {
@@ -1496,7 +1522,7 @@ impl PanelSpace {
             ))
         };
 
-        let count = overflow_space.elements().count();
+        let count = overflow_cnt;
         if let Some(overflow_popup) = popup {
             let e = new_popup(count);
             let output = self.output.as_ref().map(|o| &o.1).unwrap();
@@ -1550,7 +1576,7 @@ impl PanelSpace {
             self.is_dirty = true;
             self.needs_layout = true;
         }
-        overflow
+        (overflow, moved)
     }
 
     fn move_from_overflow(
@@ -1812,9 +1838,6 @@ impl PanelSpace {
                 w.send_frame(&output, Duration::from_secs(1), None, |_, _| {
                     Some(output_clone.clone())
                 });
-                w.refresh();
-                self.is_dirty = true;
-                self.needs_layout = true;
             }
         }
     }
@@ -1851,11 +1874,34 @@ fn weighted_priority(w: &(Window, u32, i32)) -> u32 {
 // they can have nested popups in a common use case now too.
 // overflow buttons go in the original space.
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverflowSection {
     Left,
     Center,
     Right,
+}
+
+const OVERFLOW_ROW_LEN: usize = 8;
+
+fn overflow_popup_size(
+    count: usize,
+    applet_size_unit_major: u32,
+    applet_size_unit_cross: u32,
+    spacing: i32,
+    is_horizontal: bool,
+) -> (f32, f32) {
+    let per_row = count.min(OVERFLOW_ROW_LEN);
+    let rows = count.div_ceil(OVERFLOW_ROW_LEN);
+    let mut popup_major = 2. * BORDER_WIDTH as f32
+        + per_row as f32 * applet_size_unit_major as f32
+        + per_row.saturating_sub(1) as f32 * spacing as f32;
+    let mut popup_cross = 2. * BORDER_WIDTH as f32
+        + rows as f32 * applet_size_unit_cross as f32
+        + rows.saturating_sub(1) as f32 * spacing as f32;
+    if !is_horizontal {
+        std::mem::swap(&mut popup_major, &mut popup_cross);
+    }
+    (popup_major, popup_cross)
 }
 
 #[derive(Debug, Clone)]

@@ -379,9 +379,10 @@ impl WrapperSpace for SpaceContainer {
         let p_client = popup.wl_surface().client().map(|c| c.id());
 
         if let Some(space) = space_for_client_mut(&mut self.space_list, p_client.as_ref()) {
-            space.reposition_popup(popup, positioner_state, token)?
+            space.reposition_popup(popup, positioner_state, token)
+        } else {
+            anyhow::bail!("Failed to find popup with matching client id")
         }
-        anyhow::bail!("Failed to find popup with matching client id")
     }
 
     fn handle_events(

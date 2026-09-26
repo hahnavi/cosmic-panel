@@ -19,23 +19,18 @@ impl PanelSpace {
             tracing::info!("Closing popup: {:?}", p.popup.c_popup.wl_surface());
             p.s_surface.send_popup_done();
             to_destroy.push((
-                p.popup.c_popup.xdg_popup().clone(),
                 p.popup.c_popup.wl_surface().clone(),
                 Some(p.s_surface.wl_surface().clone()),
             ));
             false
         });
-        if self.overflow_popup.as_ref().is_some_and(|(p, _)| !exclude(p)) {
+        if self.overflow_popup.as_ref().is_some_and(|p| !exclude(&p.0)) {
             let (popup, _) = self.overflow_popup.take().unwrap();
             tracing::info!("Closing overflow popup: {:?}", popup.c_popup.wl_surface());
-            to_destroy.push((
-                popup.c_popup.xdg_popup().clone(),
-                popup.c_popup.wl_surface().clone(),
-                None,
-            ));
+            to_destroy.push((popup.c_popup.wl_surface().clone(), None));
         }
 
-        for (popup, surface, s_surface) in to_destroy {
+        for (surface, s_surface) in to_destroy {
             self.shared.c_focused_surface.borrow_mut().retain(|s| s.0 != surface);
             self.shared.c_hovered_surface.borrow_mut().retain(|s| s.0 != surface);
 
@@ -45,8 +40,6 @@ impl PanelSpace {
                 self.s_hovered_surface
                     .retain(|s| !s.surface.wl_surface().is_some_and(|s| s.as_ref() == &s_surface));
             }
-            popup.destroy();
-            surface.destroy();
         }
     }
 

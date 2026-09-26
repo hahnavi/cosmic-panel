@@ -138,6 +138,8 @@ pub fn run(
 
         event_loop.dispatch(dispatch_timeout, &mut global_state)?;
 
+        let time = global_state.start_time.elapsed().as_millis() as u32;
+
         // rendering
         {
             let space = &mut global_state.space;
@@ -146,7 +148,7 @@ pub fn run(
                 &s_dh,
                 &global_state.client_state.queue_handle,
                 &mut global_state.server_state.popup_manager,
-                global_state.start_time.elapsed().as_millis().try_into()?,
+                time,
                 // Fallback frame-callback throttle for embedded applets;
                 // panels override it with the frame duration of their own
                 // output (see `PanelSpace::render`).
@@ -156,10 +158,7 @@ pub fn run(
         global_state.draw_dnd_icon();
 
         if let Some(renderer) = global_state.space.renderer() {
-            global_state.client_state.draw_layer_surfaces(
-                renderer,
-                global_state.start_time.elapsed().as_millis().try_into()?,
-            );
+            global_state.client_state.draw_layer_surfaces(renderer, time);
         }
 
         // flush events generated for embedded clients while rendering (e.g.

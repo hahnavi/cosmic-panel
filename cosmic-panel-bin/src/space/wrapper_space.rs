@@ -660,62 +660,70 @@ impl WrapperSpace for PanelSpace {
                         let client_id_clone = client_id.clone();
                         let id_clone = id_clone.clone();
 
-                        if let Some(err_code) = err_code {
-                            error_span!("stderr", client = ?client_id).in_scope(|| {
-                                error!("{}: exited with code {}", id_clone, err_code);
-                            });
-                        } else {
-                            info_span!("stderr", client = ?client_id).in_scope(|| {
-                                error!("{}: exited without error", id_clone);
-                            });
+                        match err_code {
+                            Some(err_code) => {
+                                error_span!("stderr", client = ?client_id).in_scope(|| {
+                                    error!("{}: exited with code {}", id_clone, err_code);
+                                });
+                            },
+                            None => {
+                                error_span!("stderr", client = ?client_id).in_scope(|| {
+                                    error!("{}: exited by signal or stop", id_clone);
+                                });
+                            },
                         }
                         let my_list = my_list.clone();
                         let mut display_handle = display_handle.clone();
                         let applet_tx_clone = applet_tx_clone.clone();
-                        let (c, client_socket) = get_client_sock(&mut display_handle);
-                        let raw_client_socket = client_socket.as_raw_fd();
-                        let mut applet_env = Vec::with_capacity(1);
-                        let mut fds: Vec<OwnedFd> = Vec::with_capacity(2);
-                        let should_restart = is_restarting && err_code.is_some();
-                        let security_context = if requests_wayland_display && should_restart {
-                            security_context_manager_clone.as_ref().and_then(
-                                |security_context_manager| {
-                                    let active_output = active_output.clone();
-
-                                    security_context_manager
-                                        .create_listener::<SpaceContainer>(&qh_clone)
-                                        .ok()
-                                        .inspect(|security_context| {
-                                            security_context.set_sandbox_engine(NAME.to_string());
-                                            security_context.set_app_id(id_clone.clone());
-                                            security_context.set_instance_id(format!(
-                                                "{}.{}",
-                                                id_clone, active_output
-                                            ));
-                                            security_context.commit();
-
-                                            let data =
-                                                security_context.data::<SecurityContext>().unwrap();
-                                            let privileged_socket =
-                                                data.conn.lock().unwrap().take().unwrap();
-                                            applet_env.push((
-                                                "X_PRIVILEGED_WAYLAND_SOCKET".to_string(),
-                                                privileged_socket.0.as_raw_fd().to_string(),
-                                            ));
-                                            fds.push(privileged_socket.0.into());
-                                        })
-                                },
-                            )
-                        } else {
-                            None
-                        };
-
                         let args = args.clone();
+                        let security_context_manager_restart =
+                            security_context_manager_clone.clone();
+                        let active_output_restart = active_output.clone();
+                        let qh_restart = qh_clone.clone();
                         async move {
-                            if !should_restart {
+                            if !is_restarting {
                                 _ = pman.stop_process(key).await;
                                 return;
                             }
+
+                            let (c, client_socket) = get_client_sock(&mut display_handle);
+                            let raw_client_socket = client_socket.as_raw_fd();
+                            let mut applet_env = Vec::with_capacity(1);
+                            let mut fds: Vec<OwnedFd> = Vec::with_capacity(2);
+                            let security_context = if requests_wayland_display {
+                                security_context_manager_restart.as_ref().and_then(
+                                    |security_context_manager| {
+                                        let active_output = active_output_restart.clone();
+
+                                        security_context_manager
+                                            .create_listener::<SpaceContainer>(&qh_restart)
+                                            .ok()
+                                            .inspect(|security_context| {
+                                                security_context
+                                                    .set_sandbox_engine(NAME.to_string());
+                                                security_context.set_app_id(id_clone.clone());
+                                                security_context.set_instance_id(format!(
+                                                    "{}.{}",
+                                                    id_clone, active_output
+                                                ));
+                                                security_context.commit();
+
+                                                let data = security_context
+                                                    .data::<SecurityContext>()
+                                                    .unwrap();
+                                                let privileged_socket =
+                                                    data.conn.lock().unwrap().take().unwrap();
+                                                applet_env.push((
+                                                    "X_PRIVILEGED_WAYLAND_SOCKET".to_string(),
+                                                    privileged_socket.0.as_raw_fd().to_string(),
+                                                ));
+                                                fds.push(privileged_socket.0.into());
+                                            })
+                                    },
+                                )
+                            } else {
+                                None
+                            };
 
                             if is_notification_applet {
                                 let (tx, rx) = oneshot::channel();
@@ -821,17 +829,21 @@ impl WrapperSpace for PanelSpace {
     }
 
     fn dirty_window(&mut self, _dh: &DisplayHandle, s: &s_WlSurface) {
-        self.is_dirty = true;
-        self.needs_layout = true;
-        self.last_dirty = Some(Instant::now());
         if let Some(w) = self
             .space
             .elements()
             .filter_map(|w| if let CosmicMappedInternal::Window(w) = w { Some(w) } else { None })
             .find(|w| w.wl_surface().is_some_and(|w| w.as_ref() == s))
         {
+            let prev_bbox = w.bbox();
             w.on_commit();
             w.refresh();
+            if w.bbox() != prev_bbox {
+                self.needs_layout = true;
+            }
+            self.is_dirty = true;
+            self.last_dirty = Some(Instant::now());
+            return;
         }
 
         if let Some(w) = self
@@ -846,19 +858,21 @@ impl WrapperSpace for PanelSpace {
                 }
             })
         {
+            let prev_size = w.bbox().size;
+            w.on_commit();
+            w.refresh();
             if let Some(p) = self.overflow_popup.as_mut() {
                 p.0.dirty = true;
             }
-            w.on_commit();
-            w.refresh();
+            if w.bbox().size != prev_size {
+                self.needs_layout = true;
+                self.is_dirty = true;
+                self.last_dirty = Some(Instant::now());
+            }
         }
     }
 
     fn dirty_popup(&mut self, _dh: &DisplayHandle, s: &s_WlSurface) {
-        self.is_dirty = true;
-        self.needs_layout = true;
-        self.space.refresh();
-
         if let Some(p) = self.popups.iter_mut().find(|p| p.s_surface.wl_surface() == s) {
             // the client is done setting up its popup, and any `grab` it
             // requested has been forwarded from the pre-commit hook
@@ -1654,6 +1668,14 @@ impl WrapperSpace for PanelSpace {
             self.popups.iter_mut().find(|p| surface == p.popup.c_popup.wl_surface())
         {
             p.popup.has_frame = true;
+        } else if let Some(s) =
+            self.subsurfaces.iter_mut().find(|s| surface == &s.subsurface.c_surface)
+        {
+            s.subsurface.has_frame = true;
+        } else if let Some((p, _)) =
+            self.overflow_popup.as_mut().filter(|(p, _)| surface == p.c_popup.wl_surface())
+        {
+            p.has_frame = true;
         }
     }
 

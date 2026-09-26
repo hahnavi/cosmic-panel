@@ -19,11 +19,12 @@ use smithay::backend::renderer::element::surface::{
 use smithay::backend::renderer::element::utils::CropRenderElement;
 use smithay::backend::renderer::element::{AsRenderElements, RenderElement, UnderlyingStorage};
 use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer};
+use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
 use smithay::backend::renderer::{Bind, Color32F, Frame, Renderer};
 use smithay::desktop::utils::send_frames_surface_tree;
 use smithay::reexports::wayland_server::Resource;
 use smithay::utils::user_data::UserDataMap;
-use smithay::utils::{Buffer, IsAlive, Physical, Point, Rectangle};
+use smithay::utils::{Buffer, IsAlive, Physical, Point, Rectangle, Scale};
 use smithay::wayland::seat::WaylandFocus;
 
 pub(crate) enum PanelRenderElement {
@@ -41,7 +42,7 @@ impl smithay::backend::renderer::element::Element for PanelRenderElement {
         }
     }
 
-    fn current_commit(&self) -> smithay::backend::renderer::utils::CommitCounter {
+    fn current_commit(&self) -> CommitCounter {
         match self {
             Self::Wayland(e, ..) => e.current_commit(),
             Self::Crop(e) => e.current_commit(),
@@ -57,12 +58,32 @@ impl smithay::backend::renderer::element::Element for PanelRenderElement {
         }
     }
 
-    fn geometry(&self, scale: smithay::utils::Scale<f64>) -> Rectangle<i32, Physical> {
+    fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
         match self {
             Self::Wayland(e) => e.geometry(scale),
             Self::Crop(e) => e.geometry(scale),
             // XXX hack don't know how else to avoid scaling twice
             Self::Iced(e) => e.geometry(1.0.into()),
+        }
+    }
+
+    fn damage_since(
+        &self,
+        scale: Scale<f64>,
+        commit: Option<CommitCounter>,
+    ) -> DamageSet<i32, Physical> {
+        match self {
+            Self::Wayland(e) => e.damage_since(scale, commit),
+            Self::Crop(e) => e.damage_since(scale, commit),
+            Self::Iced(e) => e.damage_since(1.0.into(), commit),
+        }
+    }
+
+    fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+        match self {
+            Self::Wayland(e) => e.opaque_regions(scale),
+            Self::Crop(e) => e.opaque_regions(scale),
+            Self::Iced(e) => e.opaque_regions(1.0.into()),
         }
     }
 }
@@ -281,7 +302,6 @@ impl PanelSpace {
                 let _res =
                     my_renderer.render_output(renderer, &mut f, age, &elements, clear_color)?;
                 drop(f);
-                // let mut dmg = res.damage.cloned();
 
                 egl_surface.swap_buffers(None)?;
 
@@ -381,13 +401,13 @@ impl PanelSpace {
                 && subsurface.s_surface.alive()
                 && subsurface.subsurface.c_surface.is_alive()
                 && subsurface.subsurface.has_frame
+                && subsurface.subsurface.egl_surface.is_some()
         }) {
-            _ = unsafe {
-                renderer.egl_context().make_current_with_surface(&subsurface.subsurface.egl_surface)
-            };
-            let age = subsurface.subsurface.egl_surface.buffer_age().unwrap_or_default() as usize;
+            let egl_surface = subsurface.subsurface.egl_surface.as_mut().unwrap();
+            _ = unsafe { renderer.egl_context().make_current_with_surface(egl_surface) };
+            let age = egl_surface.buffer_age().unwrap_or_default() as usize;
 
-            let mut f = renderer.bind(&mut subsurface.subsurface.egl_surface)?;
+            let mut f = renderer.bind(egl_surface)?;
 
             let mut loc = subsurface.subsurface.rectangle.loc;
             loc.x *= -1;
@@ -410,7 +430,7 @@ impl PanelSpace {
             drop(f);
             let mut dmg = res.damage.cloned();
 
-            subsurface.subsurface.egl_surface.swap_buffers(dmg.as_deref_mut())?;
+            subsurface.subsurface.egl_surface.as_ref().unwrap().swap_buffers(dmg.as_deref_mut())?;
 
             if let Some(output) = popup_output.as_ref() {
                 let primary_output = output.clone();
@@ -433,6 +453,7 @@ impl PanelSpace {
         // render to overflow_popup
         if let Some((p, section)) = self.overflow_popup.as_mut().filter(|(p, _)| {
             p.dirty
+                && p.has_frame
                 && p.egl_surface.is_some()
                 && p.state.is_none()
                 && p.c_popup.wl_surface().is_alive()
@@ -532,6 +553,7 @@ impl PanelSpace {
             let wl_surface = p.c_popup.wl_surface();
             wl_surface.frame(qh, wl_surface.clone());
             p.dirty = false;
+            p.has_frame = false;
             wl_surface.commit();
         }
 

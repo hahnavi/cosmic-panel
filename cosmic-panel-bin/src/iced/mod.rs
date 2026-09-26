@@ -195,12 +195,38 @@ impl<P: Program> IcedProgram for ProgramWrapper<P> {
     }
 }
 
+#[derive(Debug)]
+struct IcedBuffer {
+    buffer: MemoryRenderBuffer,
+    mask: Option<tiny_skia::Mask>,
+    raster_gen: u64,
+    raster_size: Size<i32, smithay::utils::Buffer>,
+}
+
+impl IcedBuffer {
+    fn new(buffer_size: Size<i32, smithay::utils::Buffer>) -> Self {
+        Self {
+            buffer: MemoryRenderBuffer::new(
+                Fourcc::Argb8888,
+                buffer_size,
+                1,
+                Transform::Normal,
+                None,
+            ),
+            mask: None,
+            raster_gen: 0,
+            raster_size: buffer_size,
+        }
+    }
+}
+
 struct IcedElementInternal<P: Program + Send + 'static> {
     // draw buffer
     outputs: HashSet<Output>,
-    buffers: HashMap<OrderedFloat<f64>, (MemoryRenderBuffer, Color)>,
+    buffers: HashMap<OrderedFloat<f64>, IcedBuffer>,
     pending_update: Option<Instant>,
     request_redraws: bool,
+    raster_generation: u64,
 
     // state
     size: Size<i32, Logical>,
@@ -219,50 +245,6 @@ struct IcedElementInternal<P: Program + Send + 'static> {
     scheduler: Scheduler<Option<<P as Program>::Message>>,
     executor_token: Option<RegistrationToken>,
     rx: Receiver<Option<<P as Program>::Message>>,
-}
-
-impl<P: Program + Send + Clone + 'static> Clone for IcedElementInternal<P> {
-    fn clone(&self) -> Self {
-        let handle = self.handle.clone();
-        let (executor, scheduler) = calloop::futures::executor().expect("Out of file descriptors");
-        let (tx, rx) = std::sync::mpsc::channel();
-        let executor_token = handle
-            .insert_source(executor, move |message, _, _| {
-                let _ = tx.send(message);
-            })
-            .ok();
-
-        if !self.state.is_queue_empty() {
-            tracing::warn!("Missing force_update call");
-        }
-        let mut renderer = IcedRenderer::new(Font::default(), Pixels(16.0));
-        let state = State::new(
-            ID.clone(),
-            ProgramWrapper(self.state.program().0.clone(), handle.clone()),
-            IcedSize::new(self.size.w as f32, self.size.h as f32),
-            &mut renderer,
-        );
-        let request_redraws = self.request_redraws;
-
-        IcedElementInternal {
-            outputs: self.outputs.clone(),
-            buffers: self.buffers.clone(),
-            pending_update: self.pending_update,
-            size: self.size,
-            cursor_pos: self.cursor_pos,
-            theme: self.theme.clone(),
-            panel_id: self.panel_id,
-            touch_map: HashMap::new(),
-            last_touch_frame: None,
-            renderer,
-            state,
-            handle,
-            scheduler,
-            executor_token,
-            rx,
-            request_redraws,
-        }
-    }
 }
 
 impl<P: Program + Send + 'static> fmt::Debug for IcedElementInternal<P> {
@@ -321,6 +303,7 @@ impl<P: Program + Send + 'static> IcedElement<P> {
             outputs: HashSet::new(),
             buffers: HashMap::new(),
             pending_update: None,
+            raster_generation: 0,
             size,
             cursor_pos: None,
             touch_map: HashMap::new(),
@@ -375,11 +358,10 @@ impl<P: Program + Send + 'static> IcedElement<P> {
         }
 
         internal_ref.size = size;
-        for (scale, (buffer, ..)) in internal_ref.buffers.iter_mut() {
+        for (scale, entry) in internal_ref.buffers.iter_mut() {
             let buffer_size =
                 internal_ref.size.to_f64().to_buffer(**scale, Transform::Normal).to_i32_round();
-            *buffer =
-                MemoryRenderBuffer::new(Fourcc::Argb8888, buffer_size, 1, Transform::Normal, None);
+            *entry = IcedBuffer::new(buffer_size);
         }
 
         if internal_ref.pending_update.is_none() {
@@ -394,23 +376,16 @@ impl<P: Program + Send + 'static> IcedElement<P> {
     pub fn set_theme(&self, mut theme: cosmic::Theme) {
         theme.transparent = theme.cosmic().frosted_applets;
         let mut guard = self.0.lock().unwrap();
-        guard.theme = theme.clone();
+        guard.theme = theme;
+        if guard.pending_update.is_none() {
+            guard.pending_update = Some(Instant::now());
+        }
     }
 
     pub fn force_redraw(&self) {
         let mut internal = self.0.lock().unwrap();
 
         internal.update(true);
-    }
-}
-
-impl<P: Program + Send + 'static + Clone> IcedElement<P> {
-    pub fn deep_clone(&self) -> Self {
-        let internal = self.0.lock().unwrap();
-        if !internal.state.is_queue_empty() {
-            self.force_update();
-        }
-        IcedElement(Arc::new(Mutex::new(internal.clone())))
     }
 }
 
@@ -424,6 +399,8 @@ impl<P: Program + Send + 'static> IcedElementInternal<P> {
         if !force {
             return Vec::new();
         }
+
+        self.raster_generation = self.raster_generation.wrapping_add(1);
 
         let cursor = self
             .cursor_pos
@@ -815,19 +792,7 @@ impl<P: Program + Send + 'static> SpaceElement for IcedElement<P> {
         if !internal.buffers.contains_key(&OrderedFloat(scale)) {
             let buffer_size =
                 internal.size.to_f64().to_buffer(scale, Transform::Normal).to_i32_round();
-            internal.buffers.insert(
-                OrderedFloat(scale),
-                (
-                    MemoryRenderBuffer::new(
-                        Fourcc::Argb8888,
-                        buffer_size,
-                        1,
-                        Transform::Normal,
-                        None,
-                    ),
-                    cosmic::iced::Color::TRANSPARENT,
-                ),
-            );
+            internal.buffers.insert(OrderedFloat(scale), IcedBuffer::new(buffer_size));
         }
         internal.outputs.insert(output.clone());
     }
@@ -861,19 +826,7 @@ impl<P: Program + Send + 'static> SpaceElement for IcedElement<P> {
             changed = true;
             let buffer_size =
                 internal_ref.size.to_f64().to_buffer(*scale, Transform::Normal).to_i32_round();
-            internal_ref.buffers.insert(
-                scale,
-                (
-                    MemoryRenderBuffer::new(
-                        Fourcc::Argb8888,
-                        buffer_size,
-                        1,
-                        Transform::Normal,
-                        None,
-                    ),
-                    cosmic::iced::Color::TRANSPARENT,
-                ),
-            );
+            internal_ref.buffers.insert(scale, IcedBuffer::new(buffer_size));
         }
         internal.update(changed);
     }
@@ -905,55 +858,68 @@ where
             internal_ref.pending_update = None;
         }
         let _ = internal_ref.update(force);
-        if let Some((buffer, _)) = internal_ref.buffers.get_mut(&OrderedFloat(scale.x)) {
+        if let Some(entry) = internal_ref.buffers.get_mut(&OrderedFloat(scale.x)) {
             let size: Size<i32, BufferCoords> =
                 internal_ref.size.to_f64().to_buffer(scale.x, Transform::Normal).to_i32_round();
             if size.w > 0 && size.h > 0 {
-                let state_ref = &internal_ref.state;
-                let mut clip_mask = tiny_skia::Mask::new(size.w as u32, size.h as u32).unwrap();
+                let IcedBuffer { buffer, mask, raster_gen, raster_size } = entry;
+                if *raster_gen != internal_ref.raster_generation || *raster_size != size {
+                    if !mask
+                        .as_ref()
+                        .is_some_and(|m| m.width() == size.w as u32 && m.height() == size.h as u32)
+                    {
+                        *mask = tiny_skia::Mask::new(size.w as u32, size.h as u32);
+                    }
+                    if let Some(clip_mask) = mask.as_mut() {
+                        clip_mask.clear();
+                        *raster_gen = internal_ref.raster_generation;
+                        *raster_size = size;
+                        let state_ref = &internal_ref.state;
 
-                _ = buffer.render().draw(|buf| {
-                    let mut pixels =
-                        tiny_skia::PixmapMut::from_bytes(buf, size.w as u32, size.h as u32)
-                            .expect("Failed to create pixel map");
+                        _ = buffer.render().draw(|buf| {
+                            let mut pixels =
+                                tiny_skia::PixmapMut::from_bytes(buf, size.w as u32, size.h as u32)
+                                    .expect("Failed to create pixel map");
 
-                    let background_color = state_ref.program().0.background_color();
-                    let bounds = IcedSize::new(size.w as u32, size.h as u32);
-                    let viewport = Viewport::with_physical_size(bounds, scale.x);
+                            let background_color = state_ref.program().0.background_color();
+                            let bounds = IcedSize::new(size.w as u32, size.h as u32);
+                            let viewport = Viewport::with_physical_size(bounds, scale.x);
 
-                    let damage = vec![cosmic::iced::Rectangle::new(
-                        cosmic::iced::Point::default(),
-                        viewport.logical_size(),
-                    )];
+                            let damage = vec![cosmic::iced::Rectangle::new(
+                                cosmic::iced::Point::default(),
+                                viewport.logical_size(),
+                            )];
 
-                    internal_ref.renderer.draw(
-                        &mut pixels,
-                        &mut clip_mask,
-                        &viewport,
-                        &damage,
-                        background_color,
-                    );
+                            internal_ref.renderer.draw(
+                                &mut pixels,
+                                clip_mask,
+                                &viewport,
+                                &damage,
+                                background_color,
+                            );
 
-                    let damage = damage
-                        .into_iter()
-                        .filter_map(|x| x.snap())
-                        .map(|damage_rect| {
-                            Rectangle::new(
-                                (damage_rect.x as i32, damage_rect.y as i32).into(),
-                                (bounds.width as i32, bounds.height as i32).into(),
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    state_ref.program().0.foreground(&mut pixels, &damage, scale.x as f32);
+                            let damage = damage
+                                .into_iter()
+                                .filter_map(|x| x.snap())
+                                .map(|damage_rect| {
+                                    Rectangle::new(
+                                        (damage_rect.x as i32, damage_rect.y as i32).into(),
+                                        (bounds.width as i32, bounds.height as i32).into(),
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            state_ref.program().0.foreground(&mut pixels, &damage, scale.x as f32);
 
-                    Result::<_, ()>::Ok(damage)
-                });
+                            Result::<_, ()>::Ok(damage)
+                        });
+                    }
+                }
             }
 
             if let Ok(buffer) = MemoryRenderBufferRenderElement::from_buffer(
                 renderer,
                 location.to_f64(),
-                buffer,
+                &entry.buffer,
                 Some(alpha),
                 Some(Rectangle::new(
                     (0., 0.).into(),

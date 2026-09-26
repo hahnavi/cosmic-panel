@@ -46,12 +46,22 @@ pub struct WrapperPopup {
 
 impl Drop for PanelPopup {
     fn drop(&mut self) {
+        self.egl_surface.take();
+        if let Some(fractional_scale) = self.fractional_scale.take() {
+            fractional_scale.destroy();
+        }
+        if let Some(viewport) = self.viewport.take() {
+            viewport.destroy();
+        }
         if let Some(blur) = self.blur_surface.take() {
             blur.destroy();
         }
         if let Some(corners) = self.corner_radius.take() {
             corners.destroy();
         }
+        self.c_popup.xdg_popup().destroy();
+        self.c_popup.xdg_surface().destroy();
+        self.c_popup.wl_surface().destroy();
     }
 }
 

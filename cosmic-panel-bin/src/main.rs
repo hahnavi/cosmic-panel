@@ -47,17 +47,21 @@ pub enum PanelCalloopMsg {
 #[cfg(target_env = "gnu")]
 mod malloc {
     use std::os::raw::c_int;
+    const M_TRIM_THRESHOLD: c_int = -1;
     const M_MMAP_THRESHOLD: c_int = -3;
+    const M_ARENA_MAX: c_int = -8;
 
     unsafe extern "C" {
         fn malloc_trim(pad: usize);
         fn mallopt(param: c_int, value: c_int) -> c_int;
     }
 
-    /// Prevents glibc from hoarding memory via memory fragmentation.
+    /// Prevents glibc from hoarding memory via memory fragmentation and multi-arena bloat.
     pub fn limit_mmap_threshold() {
         unsafe {
             mallopt(M_MMAP_THRESHOLD, 65536);
+            mallopt(M_TRIM_THRESHOLD, 128 * 1024);
+            mallopt(M_ARENA_MAX, 2);
         }
     }
 
@@ -155,11 +159,11 @@ fn main() -> Result<()> {
     event_loop
         .handle()
         .insert_source(
-            calloop::timer::Timer::from_duration(Duration::from_secs(600)),
+            calloop::timer::Timer::from_duration(Duration::from_secs(60)),
             |_, _, _: &mut GlobalState| {
                 tracing::trace!("Releasing free memory from the heap.");
                 malloc::trim();
-                calloop::timer::TimeoutAction::ToDuration(Duration::from_secs(600))
+                calloop::timer::TimeoutAction::ToDuration(Duration::from_secs(60))
             },
         )
         .expect("failed to insert malloc trim timer");
@@ -234,7 +238,7 @@ fn main() -> Result<()> {
                         mut env,
                         mut fds,
                     ) => {
-                        let Some(proxy) = notifications_proxy.as_mut() else {
+                        if notifications_proxy.is_none() {
                             notifications_proxy = match tokio::time::timeout(
                                 Duration::from_secs(1),
                                 notifications_conn(),
@@ -243,11 +247,15 @@ fn main() -> Result<()> {
                             {
                                 Ok(Ok(p)) => Some(p),
                                 _ => {
-                                    error!("Failed to connect to the notifications daemon",);
-                                    None
+                                    error!(
+                                        "Failed to connect to the notifications daemon; \
+                                             dropping notifications applet launch"
+                                    );
+                                    continue;
                                 },
                             };
-                            warn!("Can't start notifications applet without a connection");
+                        }
+                        let Some(proxy) = notifications_proxy.as_mut() else {
                             continue;
                         };
                         info!("Getting fd for notifications applet");

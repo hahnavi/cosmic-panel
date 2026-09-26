@@ -381,6 +381,7 @@ pub struct PanelSpace {
     pub right_overflow_popup_id: id::Id,
     pub overflow_popup: Option<(PanelPopup, OverflowSection)>,
     pub remap_attempts: u32,
+    pub overflow_stall_logged: bool,
     pub background_element: Option<BackgroundElement>,
     pub is_background_dirty: bool,
     pub last_minimize_update: Instant,
@@ -463,6 +464,7 @@ impl PanelSpace {
             right_overflow_popup_id: id::Id::new(format!("{}-right-overflow-popup", name)),
             overflow_popup: None,
             remap_attempts: 0,
+            overflow_stall_logged: false,
             background_element: None,
             is_background_dirty: false,
             last_minimize_update: Instant::now() - Duration::from_secs(1),
@@ -1308,12 +1310,6 @@ impl PanelSpace {
             self.popups.retain_mut(|p: &mut WrapperPopup| {
                 let ret = p.handle_events(popup_manager, renderer);
                 if !ret {
-                    if let Some(w) = p.popup.fractional_scale.as_ref() {
-                        w.destroy();
-                    }
-                    if let Some(w) = p.popup.viewport.as_ref() {
-                        w.destroy();
-                    }
                     self.shared
                         .c_focused_surface
                         .borrow_mut()
@@ -1945,10 +1941,10 @@ impl PanelSpace {
 
             if s_bbox != s.subsurface.rectangle && s_bbox.size.w > 0 && s_bbox.size.h > 0 {
                 let p_s_bbox = s_bbox.to_f64().to_physical_precise_round(self.scale);
-                _ = unsafe {
-                    renderer.egl_context().make_current_with_surface(&s.subsurface.egl_surface)
-                };
-                s.subsurface.egl_surface.resize(p_s_bbox.size.w, p_s_bbox.size.h, 0, 0);
+                if let Some(egl_surface) = s.subsurface.egl_surface.as_ref() {
+                    _ = unsafe { renderer.egl_context().make_current_with_surface(egl_surface) };
+                    egl_surface.resize(p_s_bbox.size.w, p_s_bbox.size.h, 0, 0);
+                }
                 s.subsurface
                     .c_subsurface
                     .set_position(offset.x + s_bbox.loc.x, offset.y + s_bbox.loc.y);
@@ -2016,21 +2012,35 @@ impl PanelSpace {
 
             c_surface.commit();
 
+            let egl_surface = match unsafe {
+                EGLSurface::new(
+                    renderer.egl_context().display(),
+                    renderer
+                        .egl_context()
+                        .pixel_format()
+                        .expect("Failed to get pixel format from EGL context "),
+                    renderer.egl_context().config_id(),
+                    client_egl_surface,
+                )
+            } {
+                Ok(egl_surface) => Some(egl_surface),
+                Err(err) => {
+                    tracing::error!("Failed to initialize EGL Surface: {:?}", err);
+                    if let Some(fractional_scale) = fractional_scale {
+                        fractional_scale.destroy();
+                    }
+                    if let Some(viewport) = viewport {
+                        viewport.destroy();
+                    }
+                    c_subsurface.destroy();
+                    c_surface.destroy();
+                    return;
+                },
+            };
             self.subsurfaces.push(WrapperSubsurface {
                 parent: parent_id.clone(),
                 subsurface: PanelSubsurface {
-                    egl_surface: unsafe {
-                        EGLSurface::new(
-                            renderer.egl_context().display(),
-                            renderer
-                                .egl_context()
-                                .pixel_format()
-                                .expect("Failed to get pixel format from EGL context "),
-                            renderer.egl_context().config_id(),
-                            client_egl_surface,
-                        )
-                        .expect("Failed to initialize EGL Surface")
-                    },
+                    egl_surface,
                     c_subsurface,
                     c_surface,
                     dirty: true,

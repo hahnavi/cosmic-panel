@@ -22,9 +22,8 @@ pub struct WrapperSubsurface {
 
 #[derive(Debug)]
 pub struct PanelSubsurface {
-    // XXX implicitly drops egl_surface first to avoid segfault
     /// the egl surface
-    pub egl_surface: EGLSurface,
+    pub egl_surface: Option<EGLSurface>,
 
     /// the subsurface on the layer shell surface
     pub c_subsurface: c_WlSubsurface,
@@ -51,15 +50,24 @@ pub struct PanelSubsurface {
     pub parent: c_WlSurface,
 }
 
+impl Drop for PanelSubsurface {
+    fn drop(&mut self) {
+        self.egl_surface.take();
+        if let Some(fractional_scale) = self.fractional_scale.take() {
+            fractional_scale.destroy();
+        }
+        if let Some(viewport) = self.viewport.take() {
+            viewport.destroy();
+        }
+        self.c_subsurface.destroy();
+        self.c_surface.destroy();
+    }
+}
+
 impl WrapperSubsurface {
     /// Handles any events that have occurred since the last call, redrawing if
     /// needed. Returns true if the surface is alive.
     pub fn handle_events(&mut self) -> bool {
-        if !self.s_surface.alive() {
-            self.subsurface.c_subsurface.destroy();
-            false
-        } else {
-            true
-        }
+        self.s_surface.alive()
     }
 }

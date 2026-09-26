@@ -21,7 +21,11 @@ pub struct CosmicWorkspaces {
 
 impl CosmicWorkspaces {
     pub fn new() -> zbus::Result<Self> {
-        let runtime = Runtime::new().expect("failed to create tokio runtime");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("failed to create tokio runtime");
         let conn = runtime.block_on(zbus::Connection::session())?;
         let proxy = runtime.block_on(CosmicWorkspacesProxy::new(
             &conn,

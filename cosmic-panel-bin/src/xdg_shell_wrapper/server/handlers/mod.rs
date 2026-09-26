@@ -1,7 +1,7 @@
 use cctk::wayland_client::Proxy;
 use smithay::wayland::viewporter::ViewportCachedState;
 use std::os::fd::OwnedFd;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use itertools::Itertools;
 use sctk::data_device_manager::data_offer::receive_to_fd;
@@ -14,7 +14,7 @@ use smithay::input::pointer::CursorImageAttributes;
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Logical, Point, Transform};
+use smithay::utils::{IsAlive, Logical, Point, Transform};
 use smithay::wayland::compositor::{SurfaceAttributes, with_states};
 use smithay::wayland::dmabuf::{DmabufHandler, ImportNotifier};
 use smithay::wayland::output::OutputHandler;
@@ -246,6 +246,45 @@ use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::input::dnd::{DnDGrab, GrabType, Source};
 use smithay::input::pointer::Focus;
 use smithay::utils::Serial;
+
+struct SharedSource<S: Source>(Arc<S>);
+
+impl<S: Source> IsAlive for SharedSource<S> {
+    fn alive(&self) -> bool {
+        self.0.alive()
+    }
+}
+
+impl<S: Source> Source for SharedSource<S> {
+    fn metadata(&self) -> Option<SourceMetadata> {
+        self.0.metadata()
+    }
+
+    fn accepted(&self, mime_type: Option<String>) {
+        self.0.accepted(mime_type);
+    }
+
+    fn choose_action(&self, action: DndAction) {
+        self.0.choose_action(action);
+    }
+
+    fn send(&self, mime_type: &str, fd: OwnedFd) {
+        self.0.send(mime_type, fd);
+    }
+
+    fn drop_performed(&self) {
+        self.0.drop_performed();
+    }
+
+    fn cancel(&self) {
+        self.0.cancel();
+    }
+
+    fn finished(&self) {
+        self.0.finished();
+    }
+}
+
 impl WaylandDndGrabHandler for GlobalState {
     fn dnd_requested<S: Source>(
         &mut self,
@@ -260,6 +299,7 @@ impl WaylandDndGrabHandler for GlobalState {
             None => return,
         };
 
+        let source = Arc::new(source);
         if let Some(metadata) = source.metadata() {
             seat.client.next_dnd_offer_is_mine = true;
             let mut actions = ClientDndAction::empty();
@@ -311,9 +351,10 @@ impl WaylandDndGrabHandler for GlobalState {
                 }
             }
             seat.client.dnd_source = Some(dnd_source);
+            let shared: Arc<dyn Source> = source.clone();
+            seat.server.dnd_source = Some(shared);
         }
 
-        // seat.server.dnd_source = source;
         seat.server.dnd_icon = icon;
 
         let seat = seat.server.seat.clone();
@@ -326,7 +367,7 @@ impl WaylandDndGrabHandler for GlobalState {
                     DnDGrab::new_pointer(
                         &self.server_state.display_handle,
                         start_data,
-                        source,
+                        SharedSource(Arc::clone(&source)),
                         seat,
                     ),
                     serial,
@@ -338,7 +379,12 @@ impl WaylandDndGrabHandler for GlobalState {
                 let start_data = touch.grab_start_data().unwrap();
                 touch.set_grab(
                     self,
-                    DnDGrab::new_touch(&self.server_state.display_handle, start_data, source, seat),
+                    DnDGrab::new_touch(
+                        &self.server_state.display_handle,
+                        start_data,
+                        SharedSource(source),
+                        seat,
+                    ),
                     serial,
                 );
             },

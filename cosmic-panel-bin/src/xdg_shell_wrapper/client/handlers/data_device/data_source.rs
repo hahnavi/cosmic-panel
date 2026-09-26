@@ -1,11 +1,9 @@
-use std::os::fd::AsFd;
-
 use crate::xdg_shell_wrapper::shared_state::GlobalState;
 use sctk::data_device_manager::data_source::DataSourceHandler;
 use sctk::reexports::client::protocol::wl_data_device_manager::DndAction as ClientDndAction;
 use sctk::reexports::client::protocol::wl_data_source::WlDataSource;
 use smithay::backend::input::InputTime;
-use smithay::reexports::wayland_server::protocol::wl_data_device_manager::DndAction;
+use smithay::input::dnd::DndAction;
 use smithay::utils::SERIAL_COUNTER;
 use smithay::wayland::selection::data_device::request_data_device_client_selection;
 
@@ -37,11 +35,10 @@ impl DataSourceHandler for GlobalState {
             None => return,
         };
 
-        // TODO write from server source to fd
-        // could be a selection source or a dnd source
+        // forward the transfer request to the embedded applet's drag source
         if is_dnd {
             if let Some(dnd_source) = seat.server.dnd_source.as_ref() {
-                dnd_source.send(mime, fd.as_fd());
+                dnd_source.send(&mime, fd.into());
             }
         } else if seat.server.selection_source.as_ref().is_some() {
             _ = request_data_device_client_selection(&seat.server.seat, mime, fd.into());
@@ -63,7 +60,7 @@ impl DataSourceHandler for GlobalState {
         };
 
         if let Some(dnd_source) = seat.server.dnd_source.as_ref() {
-            dnd_source.target(mime);
+            dnd_source.accepted(mime);
         }
     }
 
@@ -88,7 +85,7 @@ impl DataSourceHandler for GlobalState {
         }
 
         if let Some(dnd_source) = seat.server.dnd_source.take() {
-            dnd_source.cancelled();
+            dnd_source.cancel();
             seat.server.dnd_icon = None;
             seat.server.seat.get_pointer().unwrap().unset_grab(
                 self,
@@ -113,7 +110,7 @@ impl DataSourceHandler for GlobalState {
         };
 
         if let Some(dnd_source) = seat.server.dnd_source.as_ref() {
-            dnd_source.dnd_drop_performed();
+            dnd_source.drop_performed();
         }
     }
 
@@ -131,7 +128,7 @@ impl DataSourceHandler for GlobalState {
         };
 
         if let Some(dnd_source) = seat.server.dnd_source.take() {
-            dnd_source.dnd_finished();
+            dnd_source.finished();
             seat.server.dnd_icon = None;
             seat.client.dnd_icon = None;
             seat.client.dnd_source = None;
@@ -158,19 +155,18 @@ impl DataSourceHandler for GlobalState {
             None => return,
         };
 
-        let mut dnd_action = DndAction::empty();
-        if action.contains(ClientDndAction::Copy) {
-            dnd_action |= DndAction::Copy;
-        }
-        if action.contains(ClientDndAction::Move) {
-            dnd_action |= DndAction::Move;
-        }
-        if action.contains(ClientDndAction::Ask) {
-            dnd_action |= DndAction::Ask;
-        }
+        let chosen_action = if action.contains(ClientDndAction::Copy) {
+            DndAction::Copy
+        } else if action.contains(ClientDndAction::Move) {
+            DndAction::Move
+        } else if action.contains(ClientDndAction::Ask) {
+            DndAction::Ask
+        } else {
+            DndAction::None
+        };
 
         if let Some(dnd_source) = seat.server.dnd_source.as_ref() {
-            dnd_source.action(dnd_action);
+            dnd_source.choose_action(chosen_action);
         }
     }
 }

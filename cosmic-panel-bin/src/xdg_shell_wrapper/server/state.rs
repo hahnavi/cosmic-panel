@@ -1,7 +1,9 @@
+use std::sync::Arc;
+
 use smithay::desktop::PopupManager;
+use smithay::input::dnd::Source;
 use smithay::input::{Seat, SeatState};
 use smithay::reexports::wayland_server::DisplayHandle;
-use smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point};
 use smithay::wayland::background_effect::BackgroundEffectState;
@@ -99,7 +101,7 @@ impl ServerState {
 pub(crate) struct ServerSeat {
     pub(crate) seat: Seat<GlobalState>,
     pub(crate) selection_source: Option<SelectionSource>,
-    pub(crate) dnd_source: Option<WlDataSource>,
+    pub(crate) dnd_source: Option<Arc<dyn Source>>,
     pub(crate) dnd_icon: Option<WlSurface>,
 }
 
